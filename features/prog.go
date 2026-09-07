@@ -246,14 +246,33 @@ func haveProgramHelper(pt ebpf.ProgramType, helper asm.BuiltinFunc) error {
 		return err
 	}
 
-	spec := &ebpf.ProgramSpec{
-		Type: pt,
-		Instructions: asm.Instructions{
+	insns := asm.Instructions{
+		helper.Call(),
+		asm.LoadImm(asm.R0, 0, asm.DWord),
+		asm.Return(),
+	}
+
+	// bpf_set_retval requires R1 to be a scalar value, not a context
+	// pointer. Since kernel 7.2 (commit "bpf: Add validation for
+	// bpf_set_retval argument"), the verifier rejects non-scalar R1
+	// with EINVAL. Pre-load R1 with an immediate so the probe tests
+	// helper availability rather than failing argument validation.
+	// The value 0 is within the allowed range [-MAX_ERRNO, 0] on 7.2+,
+	// and accepted as ARG_ANYTHING on older kernels.
+	switch helper {
+	case asm.FnSetRetval:
+		insns = asm.Instructions{
+			asm.Mov.Imm(asm.R1, 0),
 			helper.Call(),
 			asm.LoadImm(asm.R0, 0, asm.DWord),
 			asm.Return(),
-		},
-		License: "GPL",
+		}
+	}
+
+	spec := &ebpf.ProgramSpec{
+		Type:         pt,
+		Instructions: insns,
+		License:      "GPL",
 	}
 
 	switch pt {
@@ -305,6 +324,16 @@ func haveProgramHelper(pt ebpf.ProgramType, helper asm.BuiltinFunc) error {
 		wrongProgramType = wrongProgramType || logContainsAll(verr.Log, "unknown func")
 		if wrongProgramType {
 			return fmt.Errorf("program of this type cannot use helper: %w", ebpf.ErrNotSupported)
+		}
+
+		// The verifier didn't flag the helper as unknown or
+		// unsupported for this program type. If the helper's tag
+		// appears in the log, the verifier reached the call site
+		// and rejected it for argument validation reasons (e.g.
+		// kernel 7.2+ type checks on bpf_set_retval). The helper
+		// is available — treat like EACCES.
+		if logContainsAll(verr.Log, helperTag) {
+			err = nil
 		}
 	}
 
